@@ -1,0 +1,284 @@
+import re
+import json
+import math
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+import pytesseract
+from sklearn.cluster import DBSCAN
+
+
+IMAGE_PATH = "map map.png"                  # change if needed
+OUT_CSV = "rectangles_labeled.csv"
+OUT_JSON = "rectangles_labeled.json"
+OUT_ANNOTATED = "rectangles_labeled.png"
+
+# Exact colors from your request
+ORANGE = np.array([255, 127, 39], dtype=np.int16)   # #FF7F27
+YELLOW = np.array([255, 201, 14], dtype=np.int16)   # #FFC90E
+
+# Tweak these if your source image changes
+ORANGE_DIST = 50
+YELLOW_DIST = 40
+RECT_MIN_AREA = 120
+RECT_W_RANGE = (8, 40)
+RECT_H_RANGE = (10, 45)
+
+# Valid labels visible in this type of map
+VALID_LABELS = [str(i) for i in range(1, 101)] + list("ABCDEF")
+
+
+def rgb_distance_mask(rgb: np.ndarray, target_rgb: np.ndarray, max_dist: int) -> np.ndarray:
+    dist = np.abs(rgb.astype(np.int16) - target_rgb).sum(axis=2)
+    return ((dist <= max_dist).astype(np.uint8) * 255)
+
+
+def connected_components(mask: np.ndarray, min_area: int = 1) -> pd.DataFrame:
+    n, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    rows = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area >= min_area:
+            rows.append({
+                "id": i,
+                "x": int(x),
+                "y": int(y),
+                "w": int(w),
+                "h": int(h),
+                "area": int(area),
+                "cx": float(centroids[i][0]),
+                "cy": float(centroids[i][1]),
+            })
+    return pd.DataFrame(rows)
+
+
+def detect_rectangles(rgb: np.ndarray) -> pd.DataFrame:
+    mask = rgb_distance_mask(rgb, ORANGE, ORANGE_DIST)
+    comps = connected_components(mask, min_area=RECT_MIN_AREA)
+    if comps.empty:
+        return comps
+
+    comps = comps[
+        comps["w"].between(*RECT_W_RANGE)
+        & comps["h"].between(*RECT_H_RANGE)
+    ].copy()
+
+    comps["extent"] = comps["area"] / (comps["w"] * comps["h"])
+    comps = comps[comps["extent"] > 0.95].copy()   # keeps solid orange rectangles, drops text fragments
+    comps = comps.sort_values(["y", "x"]).reset_index(drop=True)
+    return comps
+
+
+def detect_label_groups(rgb: np.ndarray) -> pd.DataFrame:
+    """
+    1) threshold near exact yellow (#FFC90E)
+    2) connected components on yellow-only characters
+    3) DBSCAN to group adjacent characters into a single label
+    """
+    mask = rgb_distance_mask(rgb, YELLOW, YELLOW_DIST)
+    comps = connected_components(mask, min_area=8)
+    if comps.empty:
+        return comps
+
+    comps = comps[
+        comps["w"].between(2, 50)
+        & comps["h"].between(5, 40)
+    ].copy()
+
+    # scale x/y so nearby characters in the same label cluster together
+    pts = np.c_[comps["cx"] / 22.0, comps["cy"] / 18.0]
+    cluster_ids = DBSCAN(eps=1.3, min_samples=1).fit(pts).labels_
+    comps["cluster"] = cluster_ids
+
+    groups = []
+    for cid, g in comps.groupby("cluster"):
+        x1 = int(g["x"].min())
+        y1 = int(g["y"].min())
+        x2 = int((g["x"] + g["w"]).max())
+        y2 = int((g["y"] + g["h"]).max())
+        groups.append({
+            "cluster": int(cid),
+            "x": x1,
+            "y": y1,
+            "w": x2 - x1,
+            "h": y2 - y1,
+            "cx": float(g["cx"].mean()),
+            "cy": float(g["cy"].mean()),
+            "n_chars": int(len(g)),
+        })
+
+    groups = pd.DataFrame(groups).sort_values(["y", "x"]).reset_index(drop=True)
+    return groups
+
+
+def normalize_ocr_label(text: str) -> str:
+    text = re.sub(r"[^0-9A-Z]", "", text.upper())
+
+    if text in VALID_LABELS:
+        return text
+
+    digits = re.sub(r"\D", "", text)
+    letters = re.sub(r"[^A-Z]", "", text)
+
+    # exact letter fallback
+    for ch in letters:
+        if ch in "ABCDEF":
+            if not digits:
+                return ch
+
+    # numeric cleanup
+    if digits:
+        # direct parse
+        try:
+            n = int(digits)
+            if 1 <= n <= 100:
+                return str(n)
+        except ValueError:
+            pass
+
+        # try all 1-3 digit substrings, prefer earliest match
+        for start in range(len(digits)):
+            for end in range(start + 1, min(len(digits), start + 3) + 1):
+                try:
+                    n = int(digits[start:end])
+                    if 1 <= n <= 100:
+                        return str(n)
+                except ValueError:
+                    pass
+
+    return text
+
+
+def ocr_label_groups(rgb: np.ndarray, groups: pd.DataFrame) -> pd.DataFrame:
+    out = groups.copy()
+    texts = []
+
+    for _, row in out.iterrows():
+        pad = 8
+        x1 = max(0, int(row["x"]) - pad)
+        y1 = max(0, int(row["y"]) - pad)
+        x2 = min(rgb.shape[1], int(row["x"] + row["w"]) + pad)
+        y2 = min(rgb.shape[0], int(row["y"] + row["h"]) + pad)
+
+        crop = rgb[y1:y2, x1:x2]
+
+        # OCR on yellow + orange to capture yellow fill and orange outline
+        yellow_mask = rgb_distance_mask(crop, YELLOW, 70)
+        orange_mask = rgb_distance_mask(crop, ORANGE, 90)
+        text_mask = cv2.bitwise_or(yellow_mask, orange_mask)
+
+        page = np.full(text_mask.shape, 255, np.uint8)
+        page[text_mask > 0] = 0
+
+        raw = pytesseract.image_to_string(
+            page,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ).strip()
+
+        texts.append(normalize_ocr_label(raw))
+
+    out["label"] = texts
+    return out
+
+
+def assign_nearest_label(rects: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, r in rects.iterrows():
+        dx = labels["cx"] - r["cx"]
+        dy = labels["cy"] - r["cy"]
+        d2 = dx * dx + dy * dy
+        idx = d2.idxmin()
+        nearest = labels.loc[idx]
+
+        rows.append({
+            "label": nearest["label"],
+            "rect_x_px": float(r["x"]),
+            "rect_y_px": float(r["y"]),
+            "rect_w_px": float(r["w"]),
+            "rect_h_px": float(r["h"]),
+            "center_x_px": float(r["cx"]),
+            "center_y_px": float(r["cy"]),
+            "label_x_px": float(nearest["cx"]),
+            "label_y_px": float(nearest["cy"]),
+            "distance_px": float(math.sqrt(float(d2.loc[idx]))),
+        })
+    return pd.DataFrame(rows)
+
+
+def add_percent_coordinates(df: pd.DataFrame, width: int, height: int) -> pd.DataFrame:
+    out = df.copy()
+    out["left_pct"] = out["rect_x_px"] / width * 100
+    out["top_pct"] = out["rect_y_px"] / height * 100
+    out["width_pct"] = out["rect_w_px"] / width * 100
+    out["height_pct"] = out["rect_h_px"] / height * 100
+    out["center_x_pct"] = out["center_x_px"] / width * 100
+    out["center_y_pct"] = out["center_y_px"] / height * 100
+    return out
+
+
+def draw_output(rgb: np.ndarray, rects_labeled: pd.DataFrame, out_path: str) -> None:
+    img = rgb.copy()
+
+    for _, row in rects_labeled.iterrows():
+        x = int(round(row["rect_x_px"]))
+        y = int(round(row["rect_y_px"]))
+        w = int(round(row["rect_w_px"]))
+        h = int(round(row["rect_h_px"]))
+        label = str(row["label"])
+
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 255), 2)
+        cv2.putText(
+            img,
+            label,
+            (x, max(18, y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            img,
+            label,
+            (x, max(18, y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+
+def main() -> None:
+    image_path = Path(IMAGE_PATH)
+    rgb = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+
+    rects = detect_rectangles(rgb)
+    labels = detect_label_groups(rgb)
+    labels = ocr_label_groups(rgb, labels)
+
+    rects_labeled = assign_nearest_label(rects, labels)
+    rects_labeled = add_percent_coordinates(rects_labeled, w, h)
+
+    rects_labeled = rects_labeled.sort_values("label", key=lambda s: s.map(
+        lambda v: (0, int(v)) if str(v).isdigit() else (1, str(v))
+    )).reset_index(drop=True)
+
+    rects_labeled.to_csv(OUT_CSV, index=False)
+    rects_labeled.to_json(OUT_JSON, orient="records", indent=2)
+
+    draw_output(rgb, rects_labeled, OUT_ANNOTATED)
+
+    print(f"Detected {len(rects_labeled)} orange rectangles")
+    print(f"Saved: {OUT_CSV}")
+    print(f"Saved: {OUT_JSON}")
+    print(f"Saved: {OUT_ANNOTATED}")
+
+
+if __name__ == "__main__":
+    main()
